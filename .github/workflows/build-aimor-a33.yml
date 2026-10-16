@@ -1,0 +1,49 @@
+name: Build AiMOR PF1007L A33 SD Boot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out photo-frame-dashboard
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabihf bison flex swig libssl-dev libgnutls28-dev \
+            python3-dev python3-setuptools python3-pyelftools bc \
+            device-tree-compiler make gcc git
+
+      - name: Clone pinned U-Boot
+        run: |
+          git clone https://github.com/u-boot/u-boot.git "$RUNNER_TEMP/u-boot"
+          git -C "$RUNNER_TEMP/u-boot" checkout e50b1e8715011def8aff1588081a2649a2c6cd47
+
+      - name: Build SD loader and read-only eMMC dump script
+        run: bash scripts/a33-sdboot/build.sh "$RUNNER_TEMP/u-boot"
+
+      - name: Verify hashes
+        run: |
+          cd diagnostics/a33-sdboot
+          sha256sum --check SHA256SUMS
+
+      - name: Upload SD boot files
+        uses: actions/upload-artifact@v4
+        with:
+          name: aimor-pf1007l-a33-sdboot
+          path: |
+            diagnostics/a33-sdboot/u-boot-sunxi-with-spl.bin
+            diagnostics/a33-sdboot/a33.scr
+            diagnostics/a33-sdboot/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
