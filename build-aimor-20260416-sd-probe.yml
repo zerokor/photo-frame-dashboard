@@ -1,0 +1,94 @@
+name: AiMOR PF1007L 20260416 SD probe (12 MHz)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout dashboard scripts
+        uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git make gcc-arm-linux-gnueabihf gcc bison flex swig libssl-dev libgnutls28-dev python3-dev python3-setuptools python3-pyelftools bc device-tree-compiler
+      - name: Checkout pinned U-Boot
+        run: |
+          git clone --filter=blob:none https://github.com/u-boot/u-boot.git /tmp/u-boot
+          git -C /tmp/u-boot checkout e50b1e8715011def8aff1588081a2649a2c6cd47
+          test "$(git -C /tmp/u-boot rev-parse HEAD)" = e50b1e8715011def8aff1588081a2649a2c6cd47
+      - name: Apply A33 low-power and 12 MHz eMMC configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> scripts/a33-sdboot/a33.config <<'EOF'
+          # PF1007L low-power experiment; not validated for this individual unit.
+          # CONFIG_AXP221_POWER is not set
+          CONFIG_SUNXI_NO_PMIC=y
+          CONFIG_SYS_CLK_FREQ=408000000
+          EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('/tmp/u-boot/arch/arm/dts/sun8i-a33-sinlinx-sina33.dts')
+          s = p.read_text()
+          pat = r'(&mmc2\s*\{)(.*?)(\n\};)'
+          matches = list(re.finditer(pat, s, re.S))
+          if len(matches) != 1:
+              raise SystemExit('Expected exactly one &mmc2 section; refusing modification')
+          m = matches[0]
+          body = m.group(2)
+          if 'max-frequency' in body:
+              raise SystemExit('An existing eMMC max-frequency is present; manual review needed')
+          s = s[:m.start()] + m.group(1) + '\n\tmax-frequency = <12000000>;' + body + m.group(3) + s[m.end():]
+          p.write_text(s)
+          assert 'max-frequency = <12000000>;' in s
+          PY
+      - name: Build the SD U-Boot and diagnostic boot script
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/a33-sdboot/build.sh /tmp/u-boot
+          O=diagnostics/a33-sdboot/build
+          grep -qx 'CONFIG_SUNXI_NO_PMIC=y' "$O/.config"
+          grep -qx 'CONFIG_SYS_CLK_FREQ=408000000' "$O/.config"
+          mkdir -p diagnostics/a33-sdboot/probe
+          cat > diagnostics/a33-sdboot/probe/probe.cmd <<'EOF'
+          # Read-only probe of eMMC. Writes markers ONLY to the SD card FAT partition.
+          setenv a33_probe reached_script
+          env export -t 0x47000000
+          fatwrite mmc 0:1 0x47000000 a33-probe.txt ${filesize}
+          if mmc dev 1; then
+            setenv a33_probe emmc_detected
+          else
+            setenv a33_probe emmc_not_detected
+          fi
+          env export -t 0x47000000
+          fatwrite mmc 0:1 0x47000000 a33-probe.txt ${filesize}
+          EOF
+          "$O/tools/mkimage" -A arm -T script -C none -n 'PF1007L non-destructive probe' \
+            -d diagnostics/a33-sdboot/probe/probe.cmd diagnostics/a33-sdboot/probe/a33.scr
+          cp diagnostics/a33-sdboot/u-boot-sunxi-with-spl.bin diagnostics/a33-sdboot/probe/
+          (cd diagnostics/a33-sdboot/probe && sha256sum u-boot-sunxi-with-spl.bin a33.scr > SHA256SUMS)
+          cat > diagnostics/a33-sdboot/probe/README.txt <<'EOF'
+          AiMOR PF1007L / A33 / 20260416 diagnostic SD boot, experimental.
+          This package contains a low-power U-Boot with eMMC capped to 12 MHz.
+          This is a test adaptation, NOT the documented Route U procedure and NOT a firmware patch.
+          The a33.scr in this artifact is probe-only, not the 2 GiB dump script.
+          If U-Boot executes a33.scr and can write to the FAT partition, it creates a33-probe.txt.
+          If no marker appears, do not repeat long waits; report the result.
+          Bootloader is flashed to SD with the repo's fel-sdcard.py; a33.scr goes to SD FAT root.
+          No automatic writes to the internal eMMC are included.
+          EOF
+          ls -lh diagnostics/a33-sdboot/probe/
+      - name: Upload SD diagnostic build
+        uses: actions/upload-artifact@v4
+        with:
+          name: aimor-pf1007l-20260416-sd-probe
+          path: diagnostics/a33-sdboot/probe/
+          if-no-files-found: error
